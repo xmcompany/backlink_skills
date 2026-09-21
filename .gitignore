@@ -16,3 +16,8 @@ bin-release/
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
+
+# bm quota butler secrets/state (2026-09-21)
+cdp/bm-cookie-manual.json
+cdp/bm2-state.json
+cdp/bm2-watch.log
