@@ -79,8 +79,10 @@ if (file_exists($exFile)) {
     wlog('耗尽休眠到期，标记清除，恢复监控');
 }
 
-// 临期券加密监控（2026-09-02 用户指定）：最后一条采样的最早到期券剩余寿命≤1500s →
-// 绕过节流/死区放行，密度由 BM_SAMPLING 防重(150s)兜底。目的：保证 record 的 360s 到期
+// 临期券加密监控（2026-09-02 用户指定；提前量 2026-09-23 用户定稿 25→15 分钟）：最后一条
+// 采样的最早到期券剩余寿命≤900s → 绕过节流放行，密度由 BM_SAMPLING 防重(150s)兜底。
+// 15 分钟=一次完整「chrome死亡→自愈(600s冷却)→复采」周期的下限，再短就是赌 chrome 当时活着。
+// 目的：保证 record 的 360s 到期
 // 抢救窗（临终6分钟无论用量直接用）内必有采样落点——常态下 360s 窗短于最坏采样间隔，
 // 本就可能整窗零落点；09-02 事故（券03:13:34作废）则是抢救窗整窗落在调度断档里。
 // 只加密监控密度，不改变用券时机。
@@ -91,7 +93,7 @@ if ($lastV && !empty($lastV['voucher_expire_at'])) {
     $vTs = strtotime($lastV['voucher_expire_at']);
     if ($vTs !== false) {
         $vLeft = $vTs - time();
-        if ($vLeft <= 1500 && $vLeft >= -300) {
+        if ($vLeft <= 900 && $vLeft >= -300) {
             wlog('临期券加密: 最早到期券剩' . $vLeft . 's → 放行采样（保 record 360s 抢救窗有落点）');
             file_put_contents($smpFile, (string) time());
             exit(1);
