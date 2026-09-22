@@ -1,18 +1,16 @@
 <?php
 /** 第1步（bat调用）：节流门。退出码 1=放行采样 0=跳过
  *  额度耗尽休眠：BM_EXHAUSTED 存在且未到重置时刻 → 直接跳过；到点自动清除恢复监控
- *  ★作息（2026-09-21 用户定稿）：工作日 09:00-18:00 白天死区，只在额度刷新点前后各采一条——
- *  刷新点 R（最后一条记录的 reset_at "HH:MM"，写库时即「下一个刷新点」，链式自续）
- *  前 = R-600s ≤ now < R 且上一条早于 R-600s（重置前~10分钟一条）
- *  后 = R+240s ≤ now < R+360s 且上一条早于 R+240s（重置后~5分钟一条）
- *  两边各恰好一条，状态由上一条相对 R 的位置决定，天然限频不走常规节流；
- *  「重置未落地重拍」兜底到 R+900s（重置常迟到1-3分钟，不补拍断链）。
- *  死区外（工作日 18:00-09:00 + 周末全天）常规监控照常，节流最小240秒（5分钟一条，盯券/临期券抢救）。
- *  阈值必须留足 60 秒相位余量：触发按 wall-clock 每5分钟，写库时刻（采样完成后 NOW()）
- *  落在触发网格的相位是 0~60s 任意值 → 下个5分钟点 age 最少 300-60=240s。
- *  取整值（300/600）或余量不足（570）都会在相位最坏时卡线跳过，退化成下一档（10/15分钟一档）。
+ *  ★采样节奏（2026-09-22 用户定稿，取代 0921「常规窗5分钟+工作日白天死区」制）：
+ *  全天分级节流——上一条采样用量 <80% → 30分钟；80-90% → 15分钟；>90% → 5分钟。
+ *  （当前额度量大不需要密集监控；临期券加密监控与刷新点采样在节流之上放行）
+ *  ★全天刷新点 ±2 分钟采样：刷新点 R（最后一条记录的 reset_at "HH:MM"，写库时即
+ *  「下一个刷新点」，链式自续）前 = R-120s ≤ now < R 且上一条早于 R-120s（重置前~2分钟一条）；
+ *  后 = R+120s ≤ now < R+300s 且上一条早于 R+120s（重置后~2分钟一条）。两边各恰好一条，
+ *  天然限频不走常规节流；「重置未落地重拍」兜底到 R+900s（重置常迟到1-3分钟，不补拍断链）。
+ *  30 分钟档下没有刷新点这条，链会漂掉最多半小时——它是稀疏节奏的定位锚，不能省。
  *  BM_SAMPLING 防重：放行时创建、record 收尾删除；150s 内视为上一轮仍在采样（多触发源并发双写防护）
- *  ★账号过滤（2026-09-21）：本表走 RDS 高频同步，B 机 d-独立 池的行会同步进来——
+ *  ★账号过滤（2026-09-21）：本表走 RDS 高频同步，他机池的行会同步进来——
  *  刷新点定位/节流/临期券判读一律只认本机 account_key（bm-account.json，缺省 shared）的行。
  */
 require __DIR__ . '/bm-quota-lib.php';
@@ -63,12 +61,12 @@ if (file_exists($exFile)) {
     $resetEpoch = is_array($j) && !empty($j['reset']) ? (float) $j['reset'] : null;
     $now = microtime(true);
     if ($wakeEpoch > $now) {
-        // ★重置点前采样（2026-08-29 用户指定）：耗尽休眠不吞刷新点前监控——自然重置前3分钟
-        // 窗口恰好放行一条（DB判重：窗口内已有采样则不放行），赶早落地/临期发券都能抓到；
+        // ★重置点前采样（2026-08-29 用户指定；2026-09-22 对齐 ±2 分钟）：耗尽休眠不吞刷新点前监控——
+        // 自然重置前2分钟窗口恰好放行一条（DB判重：窗口内已有采样则不放行），赶早落地/临期发券都能抓到；
         // 仍是100%无券时 record 原样保留休眠标记继续睡到 wake 点，不破坏原休眠节奏
-        if ($resetEpoch !== null && $now >= $resetEpoch - 180 && $now < $resetEpoch) {
+        if ($resetEpoch !== null && $now >= $resetEpoch - 120 && $now < $resetEpoch) {
             $last = db()->query("SELECT created_at FROM coding_plan_quota_logs WHERE account_key = " . db()->quote($ak) . " ORDER BY id DESC LIMIT 1")->fetch(PDO::FETCH_ASSOC);
-            if (!$last || strtotime($last['created_at']) < $resetEpoch - 180) {
+            if (!$last || strtotime($last['created_at']) < $resetEpoch - 120) {
                 wlog('重置前采样: 耗尽休眠中放行一条（重置点 ' . date('H:i', $resetEpoch) . ' 前）');
                 file_put_contents($smpFile, (string) time());
                 exit(1);
@@ -101,65 +99,46 @@ if ($lastV && !empty($lastV['voucher_expire_at'])) {
     }
 }
 
-// ★白天死区（2026-09-21 用户定稿作息）：工作日 09:00-18:00，只在额度刷新点前后各一条
-$wd = (int) date('N'); // 1=周一 7=周日
-$minutes = ((int) date('G')) * 60 + (int) date('i');
-if ($wd <= 5 && $minutes >= 540 && $minutes < 1080) {
-    // 熔断恢复探测（2026-08-28）：有熔断标记时每30分钟放行一次采样，让 record 尽早发现额度恢复
-    // 拉起续跑会话；否则死区内只能靠刷新点边缘采样，发现恢复最慢要等约2小时
-    if (file_exists(__DIR__ . '/BM_CUTOFF')) {
-        $probeFile = __DIR__ . '/BM_CUTOFF_PROBE';
-        if (time() - (float) @file_get_contents($probeFile) >= 1800) {
-            file_put_contents($probeFile, (string) microtime(true));
-            wlog('熔断恢复探测: 放行采样检查额度');
-            file_put_contents($smpFile, (string) time());
-            exit(1);
-        }
+// ★全天刷新点 ±2 分钟采样（2026-09-22 用户定稿）：取代旧「工作日白天死区」——不论用量档位，
+// 刷新点 R（最新一条有效 reset_at，链式自续）前 2 分钟窗口 / 后 2 分钟窗口各恰好一条；
+// 30 分钟稀疏档下没有这条，刷新点链会漂掉最多半小时，它是分级节奏的定位锚。
+$T = time();
+$rows = db()->query("SELECT created_at, usage_percent, reset_at FROM coding_plan_quota_logs WHERE account_key = " . db()->quote($ak) . " ORDER BY id DESC LIMIT 5")->fetchAll(PDO::FETCH_ASSOC);
+$L = $rows ? strtotime($rows[0]['created_at']) : 0; // 本账号最新一条采样时刻
+$lastPct = $rows ? (int) $rows[0]['usage_percent'] : null;
+$lastReset = $rows ? trim((string) $rows[0]['reset_at']) : '';
+// 刷新点定位：最新一条 reset_at 可能是 null（零消耗窗口）→ 回溯最近几条找有效且未过期的
+$R = null;
+foreach ($rows as $row) {
+    if (!empty($row['reset_at']) && preg_match('/^(\d{1,2}):(\d{2})$/', trim($row['reset_at']), $m)) {
+        $r = mktime((int) $m[1], (int) $m[2], 0);
+        // 已过期超1小时说明定位陈旧（旧窗口的），放弃继续找（更早的只会更旧）
+        if ($T < $r + 3600) { $R = $r; }
+        break;
     }
-    $T = time();
-    $rows = db()->query("SELECT created_at, reset_at FROM coding_plan_quota_logs WHERE account_key = " . db()->quote($ak) . " ORDER BY id DESC LIMIT 5")->fetchAll(PDO::FETCH_ASSOC);
-    $L = $rows ? strtotime($rows[0]['created_at']) : 0; // 本账号最新一条采样时刻
-    $lastReset = $rows ? trim((string) $rows[0]['reset_at']) : '';
-    // 刷新点定位：最新一条 reset_at 可能是 null（零消耗窗口）→ 回溯最近几条找有效且未过期的
-    $R = null;
-    foreach ($rows as $row) {
-        if (!empty($row['reset_at']) && preg_match('/^(\d{1,2}):(\d{2})$/', trim($row['reset_at']), $m)) {
-            $r = mktime((int) $m[1], (int) $m[2], 0);
-            // 已过期超1小时说明定位陈旧（旧窗口的），放弃继续找（更早的只会更旧）
-            if ($T < $r + 3600) { $R = $r; }
-            break;
-        }
-    }
-    $go = false; $why = '';
-    if ($R !== null) {
-        if ($R - 600 <= $T && $T < $R && $L < $R - 600) {
-            $go = true; $why = "刷新前(R=" . date('H:i', $R) . ")"; // 重置前~10分钟窗口第一条（1分钟cron下首拍落在R-10m±1m）
-        } elseif ($R + 240 <= $T && $T < $R + 360 && $L < $R + 240) {
-            $go = true; $why = "刷新后(R=" . date('H:i', $R) . "~5分钟)"; // 重置后4-6分钟窗口第一条（等重置落地）
-        } elseif ($R <= $T && $T < $R + 900 && $T - $L >= 60
-                && preg_match('/^\d{1,2}:\d{2}$/', $lastReset) && strtotime($lastReset) <= $T) {
-            // 重置未落地重拍：R+5min 首拍若早于官方实际落地（常见1-3分钟延迟），拍到的 reset_at
-            // 已成过去时，若就此沉默整段死区无人携带新刷新点→断链。1分钟粒度下逐分钟重拍，
-            // 直到拍到新窗口（reset_at变为R+5h>pct任意）或零消耗（null→走poke），窗口15分钟封顶。
-            $go = true; $why = '刷新后重置未落地重拍(last=' . $lastReset . ')';
-        }
-    }
-    if (!$go) {
-        wlog('skip: 工作日白天死区(刷新点' . ($R !== null ? date('H:i', $R) : '?') . '外)');
-        exit(0);
-    }
-    wlog('边缘采样: ' . $why);
-    file_put_contents($smpFile, (string) time());
-    exit(1); // 刷新点边缘 → 放行（不走常规节流）
 }
-
-// 常规窗口（工作日 18:00-09:00 + 周末全天）：5分钟一条（2026-09-21 用户定稿；
-// 原两档 240/540 制取消——常规监控全程 240s 盯券/临期券抢救）
-$last = db()->query("SELECT usage_percent, created_at FROM coding_plan_quota_logs WHERE account_key = " . db()->quote($ak) . " ORDER BY id DESC LIMIT 1")->fetch(PDO::FETCH_ASSOC);
-if ($last) {
-    $age = time() - strtotime($last['created_at']);
-    $minGap = 240;
-    if ($age < $minGap) { wlog('skip: 节流 last=' . $last['usage_percent'] . "% {$age}s<{$minGap}s"); exit(0); }
+$go = false; $why = '';
+if ($R !== null) {
+    if ($R - 120 <= $T && $T < $R && $L < $R - 120) {
+        $go = true; $why = "刷新前2分钟(R=" . date('H:i', $R) . ")"; // 前2分钟窗口第一条（1分钟cron下首拍落在R-2m±1m）
+    } elseif ($R + 120 <= $T && $T < $R + 300 && $L < $R + 120) {
+        $go = true; $why = "刷新后2分钟(R=" . date('H:i', $R) . ")"; // 后2-5分钟窗口第一条（等重置落地）
+    } elseif ($R <= $T && $T < $R + 900 && $T - $L >= 60
+            && preg_match('/^\d{1,2}:\d{2}$/', $lastReset) && strtotime($lastReset) <= $T) {
+        // 重置未落地重拍：R+2min 首拍若早于官方实际落地（常见1-3分钟延迟），拍到的 reset_at
+        // 已成过去时，若就此沉默要等下一档节流（最稀30分钟）→断链。1分钟粒度下逐分钟重拍，
+        // 直到拍到新窗口（reset_at变为R+5h）或零消耗（null→走poke），窗口15分钟封顶。
+        $go = true; $why = '重置未落地重拍(last=' . $lastReset . ')';
+    }
 }
+if (!$go && $rows) {
+    // ★全天分级节流（2026-09-22 用户定稿，当前额度量大不需要密集监控）：
+    // 上一条采样用量 <80% → 30分钟；80-90% → 15分钟；>90% → 5分钟。全天适用，无死区。
+    // 熔断恢复无需单独探测：≥90% 无券熔断时本档即 5 分钟，恢复最慢 5 分钟可见。
+    $age = $T - $L;
+    $minGap = $lastPct < 80 ? 1800 : ($lastPct <= 90 ? 900 : 300);
+    if ($age < $minGap) { wlog("skip: 分级节流 last={$lastPct}% {$age}s<{$minGap}s"); exit(0); }
+}
+if ($go) { wlog('刷新点采样: ' . $why); }
 file_put_contents($smpFile, (string) time());
 exit(1); // 放行
