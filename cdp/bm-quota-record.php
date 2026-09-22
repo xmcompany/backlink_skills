@@ -168,9 +168,9 @@ if (file_exists($exFile)) {
 //   voucherLeft=最早到期那张的剩余寿命（check.mjs 按到期升序取 v0），天然表达「最短寿命券」。
 // ① 激活线：用量≥95% 且有券(≤3h) 且距自然重置≥1小时 → 用（止损：自然重置在即不浪费券）
 // ② 到期抢救：券剩余寿命≤360秒 → 无论用量直接用（3小时规则的临终兜底，不用就作废）
-// ① 激活线：用量≥95% 且有券(≤3h) 且距自然重置≥1小时 → 用（2026-08-28 90→95：1分钟采样下91%用券浪费近一成存量；
-//    实测高耗速率约1%/分钟，95%触发最坏冲到97-98%仍不会击穿100%）
-if ($vouchers > 0 && $pct >= 95 && ($remainReset === null || $remainReset >= 3600) && $voucherLeft !== null && $voucherLeft <= 10800) {
+// ① 激活线：用量≥98% 且有券(≤3h) 且距自然重置≥1小时 → 用（2026-08-28 90→95；2026-09-22 用户定稿 95→98：
+//    高耗速率约1%/分钟下98%触发最坏冲到99-100%——用券 POST 在100%仍可用，可接受）
+if ($vouchers > 0 && $pct >= 98 && ($remainReset === null || $remainReset >= 3600) && $voucherLeft !== null && $voucherLeft <= 10800) {
     bm_activate_event('voucher', "激活线 pct={$pct}% 距重置" . ($remainReset === null ? '?' : (int) ($remainReset / 60) . 'm') . " 券{$vouchers}张 剩" . (int) ($voucherLeft / 60) . "m");
     wlog("USE-DECISION: 激活线 pct={$pct}% 距重置" . ($remainReset === null ? '?' : (int) ($remainReset / 60) . 'm') . " 券{$vouchers}张 剩" . (int) ($voucherLeft / 60) . "m(≤3h解锁)");
     exit(2);
